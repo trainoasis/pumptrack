@@ -1,4 +1,5 @@
 // pumptrack — a tiny-wings-style prototype. Canvas 2D, no deps.
+import { initAudio, updateAudio, playYay } from './audio';
 
 const canvas = document.getElementById('c') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
@@ -49,6 +50,12 @@ interface Ball { x: number; y: number; vx: number; vy: number; r: number; ground
 const ball: Ball = { x: 40, y: 0, vx: 340, vy: 0, r: 12, grounded: false };
 
 let bestSpeed = 0, maxDist = 0, stallT = 0, gameOver = false;
+let wheelAngle = 0;
+let prevBallX = 40;
+// Track continuous airborne time so we only "yay" real jumps, not hop-skips.
+let airborneT = 0;
+let yayPlayed = false;
+const YAY_MIN_AIR = 0.35;  // seconds of continuous air before we count it a "real" jump
 
 const reset = (): void => {
   ball.x = 40; ball.vx = 340; ball.vy = 0;
@@ -56,6 +63,10 @@ const reset = (): void => {
   ball.grounded = false;
   bestSpeed = 0; maxDist = 0; stallT = 0;
   gameOver = false;
+  wheelAngle = 0;
+  prevBallX = ball.x;
+  airborneT = 0;
+  yayPlayed = false;
 };
 reset();
 
@@ -65,10 +76,13 @@ const setDive = (v: boolean): void => { diving = v; };
 // Clicks/taps on UI controls (e.g. the level picker) must not trigger dive.
 const isUiTarget = (t: EventTarget | null): boolean =>
   !!(t && (t as HTMLElement).tagName === 'BUTTON');
+// Audio needs a user gesture to start; initAudio() is idempotent + resumes.
+const ensureAudio = (): void => { initAudio(); };
 
 addEventListener('keydown', (e: KeyboardEvent) => {
   if (e.code === 'Space') {
     e.preventDefault();
+    ensureAudio();
     if (gameOver) { reset(); return; }
     setDive(true);
   }
@@ -79,6 +93,7 @@ addEventListener('keyup', (e: KeyboardEvent) => {
 });
 addEventListener('mousedown', (e: MouseEvent) => {
   if (isUiTarget(e.target)) return;
+  ensureAudio();
   if (gameOver) { reset(); return; }
   setDive(true);
 });
@@ -86,6 +101,7 @@ addEventListener('mouseup', () => setDive(false));
 addEventListener('touchstart', (e: TouchEvent) => {
   if (isUiTarget(e.target)) return;
   e.preventDefault();
+  ensureAudio();
   if (gameOver) { reset(); return; }
   setDive(true);
 }, { passive: false });
@@ -112,6 +128,29 @@ let acc = 0, lastT = performance.now() / 1000;
 
 // Smoothed camera zoom. Zooms out while airborne so you can see where you'll land.
 let currentZoom = 1;
+
+// Biker sprite — body (no wheels) and wheel loaded separately so wheels can
+// spin independently of the frame + rider.
+const bikerBody = new Image();
+let bikerBodyReady = false;
+bikerBody.addEventListener('load', () => { bikerBodyReady = true; });
+bikerBody.src = '/biker.svg';
+
+const bikerWheel = new Image();
+let bikerWheelReady = false;
+bikerWheel.addEventListener('load', () => { bikerWheelReady = true; });
+bikerWheel.src = '/wheel.svg';
+
+// biker.svg viewBox; wheels axles in viewBox coords.
+const BIKER_VB_W = 80;
+const BIKER_VB_H = 60;
+const WHEEL_VB_R = 11;
+const REAR_AXLE_VB  = { x: 16, y: 46 };
+const FRONT_AXLE_VB = { x: 64, y: 46 };
+
+const BIKER_W = 120;
+const BIKER_H = 90;
+let currentBikerAngle = 0;
 
 function step(dt: number): void {
   if (gameOver) return;
@@ -173,6 +212,19 @@ function step(dt: number): void {
 
   if (spd < STALL_SPD) stallT += dt; else stallT = 0;
   if (stallT > STALL_TIME) gameOver = true;
+
+  // Real-jump detection: only fire yay after YAY_MIN_AIR of continuous airtime,
+  // and only once per jump. Tiny hop-skips never cross the threshold.
+  if (!ball.grounded) {
+    airborneT += dt;
+    if (!yayPlayed && airborneT >= YAY_MIN_AIR) {
+      playYay();
+      yayPlayed = true;
+    }
+  } else {
+    airborneT = 0;
+    yayPlayed = false;
+  }
 }
 
 // --- Rendering ---------------------------------------------------------------
@@ -229,25 +281,59 @@ function draw(): void {
   }
   ctx.stroke();
 
-  // Ball
+  // Biker — orientation follows slope while rolling, velocity while airborne.
+  // atan2(-vy, vx) works for both cases: on the ground vy = slope·vx, so the
+  // same formula gives -atan(slope).
   const bsx = toSX(ball.x), bsy = toSY(ball.y);
-  const br  = ball.r * zoom;
-  ctx.fillStyle = diving ? '#ffd23f' : '#ffffff';
-  ctx.beginPath();
-  ctx.arc(bsx, bsy, br, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.strokeStyle = '#111';
-  ctx.lineWidth = 2;
-  ctx.stroke();
+  const v = Math.hypot(ball.vx, ball.vy);
+  const targetAngle = v > 5 ? Math.atan2(-ball.vy, ball.vx) : currentBikerAngle;
+  currentBikerAngle += (targetAngle - currentBikerAngle) * 0.20;
 
-  // Velocity indicator
-  if (spd > 10) {
-    ctx.strokeStyle = 'rgba(255,255,255,0.6)';
-    ctx.lineWidth = 2;
+  // Wheels spin proportional to traveled distance (dx ≈ arc length).
+  // Wheel radius in world units = vb-radius × (BIKER_W / vb-width).
+  const wheelRWorld = WHEEL_VB_R * (BIKER_W / BIKER_VB_W);
+  wheelAngle += (ball.x - prevBallX) / wheelRWorld;
+  prevBallX = ball.x;
+
+  if (bikerBodyReady) {
+    const w = BIKER_W * zoom;
+    const h = BIKER_H * zoom;
+    const scaleX = w / BIKER_VB_W;
+    const scaleY = h / BIKER_VB_H;
+    // Axle positions inside the translated, rotated biker frame.
+    const rearX  = -w / 2 + REAR_AXLE_VB.x  * scaleX;
+    const rearY  = -h     + REAR_AXLE_VB.y  * scaleY;
+    const frontX = -w / 2 + FRONT_AXLE_VB.x * scaleX;
+    const frontY = -h     + FRONT_AXLE_VB.y * scaleY;
+    const wheelR = WHEEL_VB_R * scaleX;
+
+    ctx.save();
+    ctx.translate(bsx, bsy);
+    ctx.rotate(currentBikerAngle);
+
+    // Body (frame + rider, no wheels)
+    ctx.drawImage(bikerBody, -w / 2, -h, w, h);
+
+    // Wheels — rotate each around its own axle
+    if (bikerWheelReady) {
+      const drawWheel = (cx: number, cy: number): void => {
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(wheelAngle);
+        ctx.drawImage(bikerWheel, -wheelR, -wheelR, wheelR * 2, wheelR * 2);
+        ctx.restore();
+      };
+      drawWheel(rearX, rearY);
+      drawWheel(frontX, frontY);
+    }
+    ctx.restore();
+  } else {
+    // Fallback while SVG is loading.
+    const br = ball.r * zoom;
+    ctx.fillStyle = '#ffffff';
     ctx.beginPath();
-    ctx.moveTo(bsx, bsy);
-    ctx.lineTo(bsx + ball.vx * 0.06 * zoom, bsy - ball.vy * 0.06 * zoom);
-    ctx.stroke();
+    ctx.arc(bsx, bsy, br, 0, Math.PI * 2);
+    ctx.fill();
   }
 
   hud.textContent =
@@ -316,6 +402,7 @@ function frame(): void {
   acc += dt;
   while (acc >= FIXED_DT) { step(FIXED_DT); acc -= FIXED_DT; }
   draw();
+  updateAudio(ball.grounded, Math.hypot(ball.vx, ball.vy));
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
