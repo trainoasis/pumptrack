@@ -31,9 +31,10 @@
   // Each level: one sine [amplitude, freq, phase]. Starting vx fixed at 340.
   //   Launch threshold at a crest: s² > gAir / (A·f²).
   const LEVELS = [
-    { name: 'Pump basics',  terrain: [[50, 0.0100, 1.70]] },  // period 628,  launch ~290
-    { name: 'Long glides',  terrain: [[70, 0.0060, 1.70]] },  // period 1047, launch ~408 → must pump
-    { name: 'Taller waves', terrain: [[95, 0.0060, 1.70]] },  // period 1047, launch ~350, but 190 unit height swings
+    { name: 'Pump basics',  terrain: [[95, 0.0060, 1.70]] },
+    // Two incommensurate frequencies — crests vary in height and steepness
+    // because the sines drift in and out of phase along x.
+    { name: 'Varied waves', terrain: [[95, 0.0060, 1.70], [28, 0.0105, 1.90]] },
   ];
   let currentLevel = 0;
   const BASELINE = 260;
