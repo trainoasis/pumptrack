@@ -2,7 +2,7 @@
 
 A tiny-wings-style web game. Ride rolling hills, pump the downhills, launch off the crests. Canvas 2D + TypeScript, no game engine.
 
-Live: https://pumptrack-two.vercel.app
+Live: https://pumptrack.wiwacloud.com/
 
 ## Run locally
 
@@ -23,8 +23,9 @@ Deploys to Vercel automatically on push to `main` once the GitHub integration is
 ## TODO
 
 - Add Supabase + leaderboard on ESC key
-- Redesign to use a BIKER sprite instead of a ball
-- Add funky sounds
+- Redesign biker so its more realistic
+- Make sure biker leans down or changes when SPACE is pressed
+- Add better sounds + soundtrack
 - Define game goal — when do you "die"? when do you "win"?
 - Explore bots to play against (shadow-rider style) — fun, useful, or not?
 - Explore a multiplayer version
