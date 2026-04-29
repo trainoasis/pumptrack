@@ -3,10 +3,16 @@ import { initAudio, updateAudio, playYay } from './audio';
 
 const canvas = document.getElementById('c') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
+// Nearest-neighbor sampling — keep pixel art crisp under rotation/scaling.
+ctx.imageSmoothingEnabled = false;
 const hud = document.getElementById('hud')!;
 
 let W = 0, H = 0;
-const resize = (): void => { W = canvas.width = innerWidth; H = canvas.height = innerHeight; };
+const resize = (): void => {
+  W = canvas.width = innerWidth; H = canvas.height = innerHeight;
+  // Resizing the canvas resets context state — re-disable smoothing.
+  ctx.imageSmoothingEnabled = false;
+};
 resize();
 addEventListener('resize', resize);
 
@@ -50,8 +56,6 @@ interface Ball { x: number; y: number; vx: number; vy: number; r: number; ground
 const ball: Ball = { x: 40, y: 0, vx: 340, vy: 0, r: 12, grounded: false };
 
 let bestSpeed = 0, maxDist = 0, stallT = 0, gameOver = false;
-let wheelAngle = 0;
-let prevBallX = 40;
 // Track continuous airborne time so we only "yay" real jumps, not hop-skips.
 let airborneT = 0;
 let yayPlayed = false;
@@ -63,8 +67,6 @@ const reset = (): void => {
   ball.grounded = false;
   bestSpeed = 0; maxDist = 0; stallT = 0;
   gameOver = false;
-  wheelAngle = 0;
-  prevBallX = ball.x;
   airborneT = 0;
   yayPlayed = false;
 };
@@ -129,28 +131,51 @@ let acc = 0, lastT = performance.now() / 1000;
 // Smoothed camera zoom. Zooms out while airborne so you can see where you'll land.
 let currentZoom = 1;
 
-// Biker sprite — body (no wheels) and wheel loaded separately so wheels can
-// spin independently of the frame + rider.
-const bikerBody = new Image();
-let bikerBodyReady = false;
-bikerBody.addEventListener('load', () => { bikerBodyReady = true; });
-bikerBody.src = '/biker.svg';
+// Biker sprite — single horizontal strip of BIKER_FRAMES frames, wheels baked
+// in. Frames step the wheels through 90° of rotation (one full visual cycle
+// for a 4-spoke wheel due to rotational symmetry). Replace the PNG in /public
+// to re-skin; the strip's width must equal BIKER_FRAMES × BIKER_VB_W.
+const bikerImg = new Image();
+let bikerImgReady = false;
+bikerImg.addEventListener('load', () => { bikerImgReady = true; });
+bikerImg.src = '/biker.png';
 
-const bikerWheel = new Image();
-let bikerWheelReady = false;
-bikerWheel.addEventListener('load', () => { bikerWheelReady = true; });
-bikerWheel.src = '/wheel.svg';
+// Terrain fill tile (tileable both axes). Scrolls + zooms with the world.
+// Replace /public/terrain.png to re-skin.
+const terrainTile = new Image();
+let terrainPattern: CanvasPattern | null = null;
+terrainTile.addEventListener('load', () => {
+  terrainPattern = ctx.createPattern(terrainTile, 'repeat');
+});
+terrainTile.src = '/terrain.png';
+// Each tile pixel = TERRAIN_TILE_SCALE world units (matches bg parallax 2× scale).
+const TERRAIN_TILE_SCALE = 2;
 
-// biker.svg viewBox; wheels axles in viewBox coords.
-const BIKER_VB_W = 80;
-const BIKER_VB_H = 60;
-const WHEEL_VB_R = 11;
-const REAR_AXLE_VB  = { x: 16, y: 46 };
-const FRONT_AXLE_VB = { x: 64, y: 46 };
+// Parallax background layers (tileable on X). Replace PNGs in /public to re-skin.
+const bgFar = new Image();
+let bgFarReady = false;
+bgFar.addEventListener('load', () => { bgFarReady = true; });
+bgFar.src = '/bg-far.png';
+
+const bgNear = new Image();
+let bgNearReady = false;
+bgNear.addEventListener('load', () => { bgNearReady = true; });
+bgNear.src = '/bg-near.png';
+
+// Per-frame native size; sheet is BIKER_FRAMES × BIKER_VB_W wide.
+const BIKER_VB_W = 64;
+const BIKER_VB_H = 48;
+const BIKER_FRAMES = 4;
+// Wheel animation: each frame shows for BIKER_FRAME_MS, regardless of speed.
+const BIKER_FRAME_MS = 120;
 
 const BIKER_W = 120;
 const BIKER_H = 90;
 let currentBikerAngle = 0;
+// Wheel-anim clock: only advances while the bike is moving.
+let bikerAnimMs = 0;
+let lastBikerAnimT = performance.now();
+const ANIM_MIN_SPEED = 5;
 
 function step(dt: number): void {
   if (gameOver) return;
@@ -258,13 +283,41 @@ function draw(): void {
   ctx.fillStyle = sky;
   ctx.fillRect(0, 0, W, H);
 
+  // Parallax — layers scroll slower than the camera (factor < 1) and tile on X.
+  // Anchored to a fixed screen Y so they don't bob with vertical camera movement.
+  // PIXEL_SCALE: integer upscale of native art so it stays crisp.
+  const PIXEL_SCALE = 2;
+  const drawParallax = (img: HTMLImageElement, factor: number, screenBottomY: number): void => {
+    const dw = img.width  * PIXEL_SCALE;
+    const dh = img.height * PIXEL_SCALE;
+    const yTop = screenBottomY - dh;
+    // Use modulo with positive result so scrolling works either direction.
+    let offset = -((camX * factor) % dw);
+    if (offset > 0) offset -= dw;
+    for (let x = offset; x < W; x += dw) ctx.drawImage(img, x, yTop, dw, dh);
+  };
+  if (bgFarReady)  drawParallax(bgFar,  0.10, H * 0.78);
+  if (bgNearReady) drawParallax(bgNear, 0.30, H * 0.92);
+
   // Terrain
   const worldHalfW = (W / 2) / zoom;
   const xStart = camX - worldHalfW - 10;
   const xEnd   = camX + worldHalfW + 10;
   const STEP = Math.max(2, 4 / zoom);
 
-  ctx.fillStyle = '#2d1b3d';
+  if (terrainPattern) {
+    // Map pattern (tile) coords to canvas coords so the tile is anchored to
+    // world (0,0) and scales+scrolls with the camera.
+    const s = TERRAIN_TILE_SCALE * zoom;
+    terrainPattern.setTransform(new DOMMatrix([
+      s, 0, 0, s,
+      W / 2 - camX * zoom,
+      H / 2 + camY * zoom,
+    ]));
+    ctx.fillStyle = terrainPattern;
+  } else {
+    ctx.fillStyle = '#2d1b3d';
+  }
   ctx.beginPath();
   ctx.moveTo(toSX(xStart), H);
   for (let x = xStart; x <= xEnd; x += STEP) ctx.lineTo(toSX(x), toSY(terrainY(x)));
@@ -289,46 +342,29 @@ function draw(): void {
   const targetAngle = v > 5 ? Math.atan2(-ball.vy, ball.vx) : currentBikerAngle;
   currentBikerAngle += (targetAngle - currentBikerAngle) * 0.20;
 
-  // Wheels spin proportional to traveled distance (dx ≈ arc length).
-  // Wheel radius in world units = vb-radius × (BIKER_W / vb-width).
-  const wheelRWorld = WHEEL_VB_R * (BIKER_W / BIKER_VB_W);
-  wheelAngle += (ball.x - prevBallX) / wheelRWorld;
-  prevBallX = ball.x;
-
-  if (bikerBodyReady) {
+  if (bikerImgReady) {
     const w = BIKER_W * zoom;
     const h = BIKER_H * zoom;
-    const scaleX = w / BIKER_VB_W;
-    const scaleY = h / BIKER_VB_H;
-    // Axle positions inside the translated, rotated biker frame.
-    const rearX  = -w / 2 + REAR_AXLE_VB.x  * scaleX;
-    const rearY  = -h     + REAR_AXLE_VB.y  * scaleY;
-    const frontX = -w / 2 + FRONT_AXLE_VB.x * scaleX;
-    const frontY = -h     + FRONT_AXLE_VB.y * scaleY;
-    const wheelR = WHEEL_VB_R * scaleX;
+
+    // Frame select: time-based at BIKER_FRAME_MS per frame, but the clock
+    // only ticks while the bike is moving — wheels freeze when speed drops.
+    const nowMs = performance.now();
+    const dtMs = nowMs - lastBikerAnimT;
+    lastBikerAnimT = nowMs;
+    if (spd > ANIM_MIN_SPEED) bikerAnimMs += dtMs;
+    const frame = Math.floor(bikerAnimMs / BIKER_FRAME_MS) % BIKER_FRAMES;
 
     ctx.save();
     ctx.translate(bsx, bsy);
     ctx.rotate(currentBikerAngle);
-
-    // Body (frame + rider, no wheels)
-    ctx.drawImage(bikerBody, -w / 2, -h, w, h);
-
-    // Wheels — rotate each around its own axle
-    if (bikerWheelReady) {
-      const drawWheel = (cx: number, cy: number): void => {
-        ctx.save();
-        ctx.translate(cx, cy);
-        ctx.rotate(wheelAngle);
-        ctx.drawImage(bikerWheel, -wheelR, -wheelR, wheelR * 2, wheelR * 2);
-        ctx.restore();
-      };
-      drawWheel(rearX, rearY);
-      drawWheel(frontX, frontY);
-    }
+    ctx.drawImage(
+      bikerImg,
+      frame * BIKER_VB_W, 0, BIKER_VB_W, BIKER_VB_H,
+      -w / 2, -h, w, h
+    );
     ctx.restore();
   } else {
-    // Fallback while SVG is loading.
+    // Fallback while the sprite is loading.
     const br = ball.r * zoom;
     ctx.fillStyle = '#ffffff';
     ctx.beginPath();
